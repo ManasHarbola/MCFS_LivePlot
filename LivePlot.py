@@ -1,254 +1,395 @@
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-import random
+'''
+LivePlot Graphing Software
+Designed and Implemented by: Manas Harbola
+Designed for the YJSP MCFS_V2 software
+Email: mharbola3@gatech.edu
+'''
+from pyqtgraph.Qt import QtGui, QtCore
+import pyqtgraph as pg
 import base64
-from random import randint
 import numpy as np
 import re
 import sys
+import socket
 import os
 import time
 import sensorDicts
 
+#Agreed upon port through which mcfs will communicate with LivePlot.py
+PORT = 18000
+#Standardized buffer size for receiving sensor data from mcfs
+SOCKET_BUFFER_SIZE = 512
+
+'''
+Objectives:
+    -Create realtime graphs of 20+ sensors simulataneously and EFFICIENTLY
+    -Provide flexibility and intuitive controls to PROPSEN and AVSEN teams for visualizing telemetry data
+    -Create a configurable script for customizing plots, dynamic rescaling, titles, line colors, etc.
+'''
+
 class LivePlot:
-    def __init__(self, logFilename, plotcode, configDict):
+    line_colors = sensorDicts.SENSOR_CONFIGS["line_colors"]
+    #def __init__(self, plotcode, configDict):
+    def __init__(self, plotcode, slidingcode, lockedcode, minMaxVals, configDict):
         #Check parameter type
         if not(isinstance(configDict, dict)):
             raise TypeError("parameter 'configDict' of invalid type")
         
-        #self.plotIDs contains the record of which sensors to plot, each id being unique being between 0 and 52
+        #Get plotIDs for graphing
         self.plotIDs = LivePlot.getIndices(plotcode)
+        
+        #Get which plots need to be moving plots
+        self.movingPlotIDs = set(LivePlot.getIndices(slidingcode))
+        self.lockedPlotIDs = set(LivePlot.getIndices(lockedcode))
+        
+        #self.movingPlotIDs = {}
+        #self.lockedPlotIDs = {}
+        #Get which plots need to have min/max locked y-range
+        #self.lockedPlotIDs = set(LivePlot.getIndices(plotcode))
+        #self.lockedPlotIDs = set(LivePlot.getIndices(lockedcode))
 
         if len(self.plotIDs) == 0:
-            raise ValueError("no sensors selected to plot")
+            raise ValueError("no sensors selected to plot...closing plotter")
+            #sys.exit(1)
         
-        columnSize = int(np.log(len(self.plotIDs)) / np.log(2))
-        rowSize = int(np.ceil(len(self.plotIDs) / columnSize))
+        #Subplot grid dimension calculations
+        if len(self.plotIDs) == 1:
+            columnSize = 1
+            rowSize = 1
+        else:
+            columnSize = int(np.log(len(self.plotIDs)) / np.log(2))
+            rowSize = int(np.ceil(len(self.plotIDs) / columnSize))
         
-        self.save_count = configDict["save_count"]
         self.interval = configDict["interval"]
-        self.blit = configDict["blit"]
         self.subplotDims = (rowSize, columnSize)
-        self.logFilename = logFilename
 
         #self.epoch is the reference unix timestamp of t=0s
         self.epoch = 0
 
-        #self.xlsts = [[[] for i in range(self.subplotDims[1])] for j in range(self.subplotDims[0])]
-        #self.ylsts = [[[] for i in range(self.subplotDims[1])] for j in range(self.subplotDims[0])]
+        #Dictionaries for accessing x and y lists for plots
+        '''
         self.xlsts = {plotID : [] for plotID in self.plotIDs}
         self.ylsts = {plotID : [] for plotID in self.plotIDs}
+        '''
+        self.xlsts = {plotID : [np.zeros(120, dtype=np.uint32), 0] for plotID in self.plotIDs}
+        self.ylsts = {plotID : [np.zeros(120, dtype=np.float64), 0] for plotID in self.plotIDs}
 
-
+        #Initial x and y ranges for plots
         self.xlims = {plotID : configDict[plotID][3:5] for plotID in self.plotIDs}
         self.ylims = {plotID : configDict[plotID][5:7] for plotID in self.plotIDs}
+        
+        #self.lines = []
 
+        #pyqtgraph initialization
+        pg.setConfigOptions(antialias=True)
+        pg.setConfigOption('background', configDict['background'])
+        pg.setConfigOption('foreground', configDict['foreground'])
 
-        self.fig, self.axs = plt.subplots(*self.subplotDims, figsize=(14, 10), squeeze=False)
-        plt.subplots_adjust(hspace=0.60)
-        plt.style.use('fivethirtyeight')
-        colors = plt.rcParams['axes.prop_cycle']()
-        self.fig.tight_layout()
+        self.app = QtGui.QApplication(sys.argv)
+        self.win = pg.GraphicsWindow(title='MCFS LivePlot')
+        self.win.setWindowTitle('MCFS LivePlot')
+        self.win.setGeometry(5, 115, 1280, 720)
+        
+        #self.plotIDMap is a dictionary that maps sensor ID to a particular plot
+        self.plotIDMap = dict()
+        #self.lineMap is a dictionary that maps sensor ID to a particular line
+        self.lineMap = dict()
 
-        self.lines = []
-
-        #self.plotIDMap is a dictionary that maps sensor ID to a particular axs
-        self.plotIDMap = {}
-        #self.lineMap is a dictionary mapping sensor ID to line
-        self.lineMap = {}
+        #Create colorWheelIterator
+        self.colorWheelIterator = iter(LivePlot.pickColor())
 
         idx = 0
+        lockedIdx = 0
+        self.started = False
         for i in range(self.subplotDims[0]):
+            if idx >= len(self.plotIDs):
+                break
             for j in range(self.subplotDims[1]):
-                currPlotID = self.plotIDs[idx]                
-                self.plotIDMap[currPlotID] = self.axs[i][j]
-
-                self.axs[i][j].set_xlim(self.xlims[currPlotID])
-                self.axs[i][j].set_ylim(self.ylims[currPlotID])
-                self.axs[i][j].set_title(configDict[currPlotID][0], fontdict=configDict['title_font'])
-                self.axs[i][j].set_xlabel(configDict[currPlotID][1])
-                self.axs[i][j].set_ylabel(configDict[currPlotID][2])
-                self.axs[i][j].grid()
+                if idx >= len(self.plotIDs):
+                    break
                 
-                c = next(colors)['color']
+                plotID = self.plotIDs[idx]
 
-                #Check if sensor must be plotted with dotted lines
-                if configDict[currPlotID][7] == True:
-                    line, = self.axs[i][j].plot(self.xlsts[currPlotID], self.ylsts[currPlotID], marker='o', color=c)
-                    self.lineMap[currPlotID] = line
+                #Create subplot 
+                self.plotIDMap[plotID] = self.win.addPlot(row=i, col=j,)
+
+                #Set title, x, y labels
+                self.plotIDMap[plotID].setTitle(title=configDict[plotID][0], **configDict['title'])
+                self.plotIDMap[plotID].setLabel(axis='bottom', text=configDict[plotID][1], units=None, unitPrefix=None, **configDict['xlabel'])
+                self.plotIDMap[plotID].setLabel(axis='left', text=configDict[plotID][2], units=None, unitPrefix=None, **configDict['ylabel'])
+                #Set textPens
+                self.plotIDMap[plotID].getAxis('bottom').setTextPen(configDict['xlabel']['color'])
+                self.plotIDMap[plotID].getAxis('left').setTextPen(configDict['ylabel']['color'])
+
+                #Turn on grid
+                self.plotIDMap[plotID].showGrid(x=True, y=True, alpha=0.5)
+                
+                #Configure border color
+                self.plotIDMap[plotID].getViewBox().setBorder((0, 0, 0))
+
+                #self.lineMap[plotID] = self.plotIDMap[plotID].plot(pen='c', width=8)
+                
+                #self.lineMap[plotID] = self.plotIDMap[plotID].plot(pen=next(self.colorWheelIterator), width=20.0)
+                self.lineMap[plotID] = self.plotIDMap[plotID].plot(pen=pg.mkPen(next(self.colorWheelIterator), width=2.0))
+
+                #TODO: Add option to change AutoRange or Moving graph style for particular data
+
+                #Check if plot was selected to be moving
+                if plotID not in self.movingPlotIDs:
+                    self.plotIDMap[plotID].enableAutoRange(axis=self.plotIDMap[plotID].getViewBox().XAxis)
+                    self.plotIDMap[plotID].setXRange(min=self.xlims[plotID][0], max=self.xlims[plotID][1])
                 else:
-                    line, = self.axs[i][j].plot(self.xlsts[currPlotID], self.ylsts[currPlotID], color=c)
-                    self.lineMap[currPlotID] = line
+                    self.plotIDMap[plotID].setXRange(min=-self.xlims[plotID][1], max=0)
 
-                self.lines.append(line)
+                #Check if plot has restricted min and max y-vals
+                if plotID not in self.lockedPlotIDs:
+                    self.plotIDMap[plotID].enableAutoRange(axis=self.plotIDMap[plotID].getViewBox().YAxis)
+                    self.plotIDMap[plotID].setYRange(min=self.ylims[plotID][0], max=self.ylims[plotID][1])
+                else:
+                    #TODO: NEED TO CHANGE THIS TO FROM THE SPECIFIED Ymin and Ymax
+                    #self.plotIDMap[plotID].setYRange(min=self.ylims[plotID][0], max=self.ylims[plotID][1])
+                    self.plotIDMap[plotID].setYRange(min=minMaxVals[lockedIdx][0], max=minMaxVals[lockedIdx][1])
+                    lockedIdx += 1
+                
                 idx += 1
-        
-        self.ani =  animation.FuncAnimation(self.fig,
-                self.animate,
-                fargs=(LivePlot.tail(self.logFilename),),
-                save_count=self.save_count,
-                interval=self.interval,
-                blit=self.blit)
 
-    #Generator for returning new points written to file
-    def tail(filename):
-        PAUSE_DURATION = 0.1    #Duration before tail continues
-        RECONNECT_PERIOD_SECS = 5 #Duration tail will try to continue listening if no new data exists
-        ATTEMPTED_TRIES = RECONNECT_PERIOD_SECS / PAUSE_DURATION    #Number of tries tail will continue checking for new line
-        with open(filename) as f:
-            f.seek(0, os.SEEK_END)
-            while True:
-                fileLine = f.readline()
-                if not fileLine:    #line was None
-                    ATTEMPTED_TRIES -= 1
-                    time.sleep(PAUSE_DURATION)
-                    if ATTEMPTED_TRIES < 1:
-                        raise StopIteration
-                    continue
-                else:
-                    ATTEMPTED_TRIES = RECONNECT_PERIOD_SECS / PAUSE_DURATION    #Reset value
-                yield fileLine
+        #Used for setting up socket communication with mcfs
+        self.sock = None
+        self.clientsocket = None
+        self.address = None
+
+        #Flags for checking which type of data will be received next
+        self.receiveMsgSizeNext = True
+        self.msgSizeBytes = 0
+        self.msg = None
 
     #Helper function for parsing log lines one by one
-    #TODO: return special list for EOF line
     def parseLogLine(line):
         lst = re.split(" |\|", line)
-        if len(lst) < 2 or (lst[1] not in ['DB00', 'DB01']):
+        if len(lst) < 2 or (lst[1] not in {'DB00', 'DB01'}):
             return None
         #Check bytecode DB00 -> AVSEN, DB01 -> PROPSEN
         if lst[1] == 'DB00':
-            return [float(lst[0]), 'DB00', *[float(value[2:]) for value in lst[2:]]]
-        elif lst[1] == 'DB01':
-            return [float(lst[0]), 'DB01', *[float(value[3:]) for value in lst[2:]]]
+            #return [float(lst[0]), 'DB00', *[float(value[2:]) for value in lst[2:]]]
+            return [int(lst[0]), 'DB00', *[float(value[2:]) for value in lst[2:]]]
 
+        elif lst[1] == 'DB01':
+            #return [float(lst[0]), 'DB01', *[float(value[3:]) for value in lst[2:]]]
+            return [int(lst[0]), 'DB01', *[float(value[3:]) for value in lst[2:]]]
+
+    #Decodes Base64 string and determines which plots to display
     def getIndices(s):
         b = bin(int.from_bytes(base64.b64decode(s), "big"))[2:]
-        #return [len(b) - i - 1 for i in range(len(b)) if b[i] == '1']
         return [len(b) - 1 - i for i in range(len(b)) if b[i] == '1']
+    
+    def pickColor():
+        idx = 0
+        while True:
+            yield LivePlot.line_colors[idx]
+            idx = (idx + 1) % len(LivePlot.line_colors)
+    
+    #Method for updating graph data
+    def update(self):
+        #starttime = time.time()
+        
+        #Clear self.msg of any garbage value
+        self.msg = None
+        #Check if server needs to receive next size of message
+        if self.receiveMsgSizeNext:
+            self.msg = self.clientsocket.recv(4)
+            self.msgSizeBytes = int.from_bytes(bytes=self.msg, byteorder=sys.byteorder)
+            if self.msgSizeBytes <= 0:
+                print('Received negative or zero integer value from client...Ignoring..')
+                self.msgSizeBytes = 0
+            else:
+                self.receiveMsgSizeNext = False
+            return
 
-    #Method for starting animation
-    def initAnimation(self):
-        plt.show()
+        else:
+            self.msg = self.clientsocket.recv(self.msgSizeBytes)
+        
+        #print(self.msg, int.from_bytes(bytes=self.msg, byteorder=sys.byteorder))
+         
+        if self.msg == None:
+            print('no operation...client may have left...')
+            return
 
-    def animate(self, i, listener):
-        starttime = time.time()
-        try:
-            sensorReadings = LivePlot.parseLogLine(next(listener))
-        except StopIteration:
-            print("Log File hasn't been updated for 5 seconds...Stopping Plotter")
-            self.ani.event_source.stop()
-            return self.lines
+        sensorReadings = self.msg.decode("utf-8")
+        #Reset flag for receiving next message size
+        self.receiveMsgSizeNext = True
 
-        #print(sensorReadings)
+        #Check for QUIT message, and stop self.timer and close self.sock if encountered
+        if sensorReadings == "QUIT":
+            #Stop timer - prevents update from being run multiple times
+            print('Quit string received...plotter has been stopped')
+            self.timer.stop()
+            #Close self.sock for graceful exit
+            self.sock.close()
+            self.win.close()
+            sys.exit(1)
+        
+        #Convert message into list of sensor data
+        sensorReadings = LivePlot.parseLogLine(sensorReadings)
 
         if sensorReadings == None:
-            print('no operation')
-            return self.lines
-
-        needReplot = False
+            print('no operation...doing nothing this update() iteration')
+            return
+        
+        #print(len(sensorReadings), sensorReadings)
         #Determine if sensorReadings are AVSEN or PROPSEN
         if sensorReadings[1] == 'DB00':
             #Append time stamp and sensor readings
             for plotID in self.plotIDs:
                 if self.epoch == 0:
                     self.epoch = sensorReadings[0]
-                if plotID in range(0, 20):
+                if plotID in range(0, 23):
+                    '''
                     self.xlsts[plotID].append(sensorReadings[0] - self.epoch)
-                    self.ylsts[plotID].append(sensorReadings[-plotID + 21])
-                    self.lineMap[plotID].set_xdata(self.xlsts[plotID])
-                    self.lineMap[plotID].set_ydata(self.ylsts[plotID])
+                    self.ylsts[plotID].append(sensorReadings[-plotID + 24])
+                    '''
+                    self.xlsts[plotID][0][self.xlsts[plotID][1]] = sensorReadings[0] - self.epoch
+                    self.ylsts[plotID][0][self.ylsts[plotID][1]] = sensorReadings[-plotID + 24]
+
+                    self.xlsts[plotID][1] += 1
+                    self.ylsts[plotID][1] += 1
+
+                    if self.xlsts[plotID][1] >= self.xlsts[plotID][0].shape[0]:
+                        self.xlsts[plotID][0].resize(int(1.5 * self.xlsts[plotID][0].shape[0]), refcheck=False)
+                    if self.ylsts[plotID][1] >= self.ylsts[plotID][0].shape[0]:
+                        self.ylsts[plotID][0].resize(int(1.5 * self.ylsts[plotID][0].shape[0]), refcheck=False)
+                    
+                    if plotID not in self.movingPlotIDs:
+                        #self.lineMap[plotID].setData(self.xlsts[plotID], self.ylsts[plotID])
+                        self.lineMap[plotID].setData(self.xlsts[plotID][0][:self.xlsts[plotID][1]], self.ylsts[plotID][0][:self.ylsts[plotID][1]])
+                    else:
+                        '''
+                        self.lineMap[plotID].setData(self.ylsts[plotID])
+                        self.lineMap[plotID].setPos(-len(self.ylsts[plotID]), 0)
+                        '''
+                        self.lineMap[plotID].setData(self.ylsts[plotID][0][:self.ylsts[plotID][1]])
+                        self.lineMap[plotID].setPos(-self.ylsts[plotID][1], 0)
+                        
 
         elif sensorReadings[1] == 'DB01':
             #Append time stamp and sensor readings
             for plotID in self.plotIDs:
                 if self.epoch == 0:
                     self.epoch = sensorReadings[0]
-                if plotID in range(20, 53):
+                if plotID in range(23, 56):
+                    '''
                     self.xlsts[plotID].append(sensorReadings[0] - self.epoch)
-                    self.ylsts[plotID].append(sensorReadings[-plotID + 54])
-                    self.lineMap[plotID].set_xdata(self.xlsts[plotID])
-                    self.lineMap[plotID].set_ydata(self.ylsts[plotID])
+                    self.ylsts[plotID].append(sensorReadings[-plotID + 57])
+                    '''
 
-        for plotID in self.plotIDs:
-            #self.lineMap[plotID].set_xdata(self.xlsts[plotID])
-            #self.lineMap[plotID].set_ydata(self.ylsts[plotID])
+                    self.xlsts[plotID][0][self.xlsts[plotID][1]] = sensorReadings[0] - self.epoch
+                    self.ylsts[plotID][0][self.ylsts[plotID][1]] = sensorReadings[-plotID + 57]
 
-            #print(plotID, self.xlsts[plotID], self.ylsts[plotID])
+                    self.xlsts[plotID][1] += 1
+                    self.ylsts[plotID][1] += 1
 
-            #Rescale x-axis
-            if len(self.xlsts[plotID]) > 0 and self.xlsts[plotID][-1] > self.plotIDMap[plotID].get_xlim()[1]:
-                self.plotIDMap[plotID].set_xlim([self.plotIDMap[plotID].get_xlim()[0], 2.0 * self.plotIDMap[plotID].get_xlim()[1]])
-                needReplot = True
+                    if self.xlsts[plotID][1] >= self.xlsts[plotID][0].shape[0]:
+                        self.xlsts[plotID][0].resize(int(1.5 * self.xlsts[plotID][0].shape[0]), refcheck=False)
+                    if self.ylsts[plotID][1] >= self.ylsts[plotID][0].shape[0]:
+                        self.ylsts[plotID][0].resize(int(1.5 * self.ylsts[plotID][0].shape[0]), refcheck=False)
 
-            #Rescale y-axis
-            if len(self.ylsts[plotID]) > 0 and self.ylsts[plotID][-1] > self.plotIDMap[plotID].get_ylim()[1]:
-                self.plotIDMap[plotID].set_ylim([self.plotIDMap[plotID].get_ylim()[0], self.ylsts[plotID][-1]])
-                needReplot = True
-            elif len(self.ylsts[plotID]) > 0 and self.ylsts[plotID][-1] < self.plotIDMap[plotID].get_ylim()[0]:
-                self.plotIDMap[plotID].set_ylim([self.ylsts[plotID][-1], self.plotIDMap[plotID].get_ylim()[1]])
-                needReplot = True
+                    if plotID not in self.movingPlotIDs:
+                        #self.lineMap[plotID].setData(self.xlsts[plotID], self.ylsts[plotID])
+                        self.lineMap[plotID].setData(self.xlsts[plotID][0][:self.xlsts[plotID][1]], self.ylsts[plotID][0][:self.ylsts[plotID][1]])
+                    else:
+                        '''
+                        self.lineMap[plotID].setData(self.ylsts[plotID])
+                        self.lineMap[plotID].setPos(-len(self.ylsts[plotID]), 0)
+                        '''
 
-        if needReplot:
-            print('replot needed')
-            plt.draw()
+                        self.lineMap[plotID].setData(self.ylsts[plotID][0][:self.ylsts[plotID][1]])
+                        self.lineMap[plotID].setPos(-self.ylsts[plotID][1], 0)
 
-        print(time.time() - starttime)
-        return self.lines
+        #print(time.time() - starttime)
+        return
 
+    #Creates plotter window and opens socket for communication with MCFS
+    def start(self):
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update)
+        #LivePlot.update() is called every self.interval milliseconds
+        self.timer.start(self.interval)
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind((socket.gethostname(), PORT))
+
+        #LivePlot server can accept up to 5 connection requestions before cancelling connection requests
+        self.sock.listen(5)
+
+        print(socket.gethostbyname(socket.gethostname()) + " beginning connection process")
+        self.clientsocket, self.address = self.sock.accept()
+        if self.clientsocket:
+            print(f"Connection with {self.address} has been established!")
+
+        #Check for "STRT" message
+        self.msg = self.clientsocket.recv(4)
         
+        if self.msg and (self.msg.decode("utf-8") == "STRT"):
+            print("STRT sequence acknowledged...Ready to receive sensor data!")
+        else:
+            raise ValueError("STRT sequence not received...invalid data from client")
 
-
-
-#sensorMappings = {'SENSOR1': (0, 0), 'SENSOR2' : (0, 1), 'SENSOR3' : (1, 0), 'SENSOR4' : (1, 1)}
-#plot = LivePlot('logfile.log', subplotDims=(2, 2), identifiers=sensorMappings, interval=200)
-
-#TODO: replace identifiers with something like ['Sensor1', 2, 'Sensor2', 3, ...], where idenitifer is followed by number of sensor values to read from line
-
+        #Begin plotter application, now that "STRT" was received
+        if (sys.flags.interactive != 1) or not hasattr(QtCore, 'PYQT_VERSION'):
+            QtGui.QApplication.instance().exec_()
 
 '''
 New command line protocol for calling LivePlot.py:
 python3 LivePlot.py [plotcode]
-
 -plotcode is a base64 string representing all the AVSEN and PROPSEN sensors to plot
--when converted to binary, the first 53 bits of plotcode tell which sensor must be plotted (0 = don't plot, 1 = plot)
--Most significant bit is leftmost bit (aka bit 52), least significant bit is rightmost bit (aka bit 0)
--plotcode 53-bit diagram (assignment is from left to right, MSB to LSB)
-
-PROPSEN SENSORS (bits 52-20):
-bits 52-37: pt01 -> pt16
-bits 36-21: tc01 -> tc16
-bit 20: load cell
-AVSEN SENSORS (bits 19-0):
-bits 19-17: accelx1, accely1, accelz1
-bits 16-14: gyrox1, gyroy1, gyroz1
-bits 13-11: accelx2, accely2, accelz2
-bits 10-8: gyrox2, gyroy2, gyroz2
-bits 7-5: magx, magy, magz
-bit 4: altitude
-bit 3: pressure
-bits 2-0: gps_lat, gps_long, gps_alt
-
-For example, a plotcode of 
+-when converted to binary, the first 56 bits of plotcode tell which sensor must be plotted (0 = don't plot, 1 = plot)
+-Most significant bit is leftmost bit (aka bit 55), least significant bit is rightmost bit (aka bit 0)
+-plotcode 56-bit diagram (assignment is from left to right, MSB to LSB):
+--PROPSEN SENSORS (bits 55-23):
+bits 55-40: pt01 -> pt16
+bits 39-24: tc01 -> tc16
+bit 23: load cell
+--AVSEN SENSORS (bits 22-0):
+bits 22-20: accelx1, accely1, accelz1
+bits 19-17: gyrox1, gyroy1, gyroz1
+bits 16-14: accelx2, accely2, accelz2
+bits 13-11: gyrox2, gyroy2, gyroz2
+bits 10-8: magx, magy, magz
+bit 7: altitude
+bit 6: pressure
+bits 5-3: gps_lat, gps_long, gps_alt
+bits 2-0: adxl_x, adxl_y, adxl_z
+For example, a plotcode of 'AIAEAADwAgc=' tells LivePlot to plot the following sensors:
+PT_01, PT_14, Load Cell, ACCEL_X_1, ACCEL_Y_1, ACCEL_Z_1, MAG_Y, ADXL_X, ADXL_Y, ADXL_Z
 '''
+#plots = LivePlot('logfile.log', 'AIAEAADwAgc=', sensorDicts.SENSOR_CONFIGS)
+#plots = LivePlot('logfile.log', 'AP////////8=', sensorDicts.SENSOR_CONFIGS)
 
 
-'''
-#Program now uses command line arguments
-if sys.argv[1:] not in [['-plotAVSEN'], ['-plotPROPSEN']]:
-    print("Invalid command line arguments")
-elif sys.argv[1] == '-plotAVSEN':
-    plots = LivePlot(sensorConfigs.AVSEN_PLOT_CONFIG)
-    plots.initAnimation()
-else:
-    plots = LivePlot(sensorConfigs.PROPSEN_PLOT_CONFIG)
-    plots.initAnimation()
-'''
-
-'''
 if len(sys.argv[1:]) != 1:
-    print("Invalid command line args")
+    print("Invalid command line args...closing plotter")
+    sys.exit(1)
+
+'''
+#Check if there are at least 3 Base64 strings
+if len(sys.argv[:4]) < 4:
+    print("Invalid command line args...closing plotter")
+    sys.exit(1)
 '''
 
-#plots = LivePlot('logfile.log', 'AAAAAA4AAA==', sensorDicts.SENSOR_CONFIGS)
-plots = LivePlot('logfile.log', 'AAAAAA///w==', sensorDicts.SENSOR_CONFIGS)
-plots.initAnimation()
+#Base64 strings deciding which symbols to plot, make sliding, and lock y range, respectively
+plotting_b64str = sys.argv[1]
+sliding_b64str = sys.argv[2]
+locked_b64str = sys.argv[3]
+
+minMaxValues = [(float(sys.argv[i]), float(sys.argv[i + 1])) for i in range(4, len(sys.argv), 2)]
+
+#Create object
+#plots = LivePlot('logfile.log', 'AIAEAADwAgc=', sensorDicts.SENSOR_CONFIGS)
+#plots = LivePlot(logFilePath, b64str, sensorDicts.SENSOR_CONFIGS)
+#plots = LivePlot('logfile.log', b64str, sensorDicts.SENSOR_CONFIGS)
+
+#plots = LivePlot(plotting_b64str, sensorDicts.SENSOR_CONFIGS)
+plots = LivePlot(plotting_b64str, sliding_b64str, locked_b64str, minMaxValues, sensorDicts.SENSOR_CONFIGS)
+
+#Run window
+plots.start()
